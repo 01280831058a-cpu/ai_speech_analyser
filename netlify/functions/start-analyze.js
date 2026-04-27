@@ -1,11 +1,20 @@
-import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { Buffer } from 'node:buffer';
+import Busboy from 'busboy';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import crypto from 'crypto';
+
+// Переменные окружения Netlify:
+// YANDEX_API_KEY, YANDEX_FOLDER_ID (SpeechKit & GPT)
+// YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME
 
 const YANDEX_API_KEY = process.env.YANDEX_API_KEY;
 const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID;
 const BUCKET_NAME = process.env.YC_BUCKET_NAME;
+const S3_ENDPOINT = 'https://storage.yandexcloud.net';
+
 const s3 = new S3Client({
   region: 'ru-central1',
-  endpoint: 'https://storage.yandexcloud.net',
+  endpoint: S3_ENDPOINT,
   credentials: {
     accessKeyId: process.env.YC_ACCESS_KEY_ID,
     secretAccessKey: process.env.YC_SECRET_ACCESS_KEY,
@@ -15,82 +24,91 @@ const s3 = new S3Client({
 export async function handler(event) {
   const headers = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS'
   };
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers, body: '' };
   }
-  const operationId = event.queryStringParameters?.operationId;
-  const task = event.queryStringParameters?.task;
-  if (!operationId) {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing operationId' }) };
-  }
 
   try {
-    // 1. Проверяем статус асинхронного распознавания
-    const statusResp = await fetch(`https://operation.api.cloud.yandex.net/operations/${operationId}`, {
-      headers: { 'Authorization': `Api-Key ${YANDEX_API_KEY}` }
-    });
-    const opData = await statusResp.json();
-    if (opData.done !== true) {
-      return { statusCode: 200, headers, body: JSON.stringify({ status: 'processing' }) };
-    }
-    if (opData.error) {
-      return { statusCode: 200, headers, body: JSON.stringify({ status: 'failed', error: opData.error.message }) };
+    const { task, audioBuffer, originalName } = await parseMultipart(event);
+    if (!task || !audioBuffer) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing task or audio' }) };
     }
 
-    // 2. Извлекаем распознанный текст
-    const recognizedText = opData.response?.chunks?.map(chunk => chunk.alternatives[0]?.text).join(' ') || '';
-    if (!recognizedText) {
-      return { statusCode: 200, headers, body: JSON.stringify({ status: 'failed', error: 'Пустой текст распознавания' }) };
-    }
+    // 1. Загружаем аудио в Yandex Object Storage (публичный доступ на чтение)
+    const fileExt = originalName.split('.').pop().toLowerCase();
+    const key = `speech_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${fileExt}`;
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+      Body: audioBuffer,
+      ContentType: `audio/${fileExt === 'm4a' ? 'm4a' : (fileExt === 'mp3' ? 'mpeg' : 'wav')}`,
+      ACL: 'public-read',   // временно публичный для доступа SpeechKit
+    }));
 
-    // 3. Анализ через YandexGPT
-    const feedback = await analyzeWithGPT(task, recognizedText);
+    const fileUrl = `https://${BUCKET_NAME}.storage.yandexcloud.net/${key}`;
 
-    // 4. (опционально) Удаляем файл из бакета, чтобы не накапливать
-    // Для удаления нужно знать ключ объекта. Мы не храним ключ в функции. Лучше удалить через отдельную очистку позже, или передавать ключ из start-analyze.
-    // Но для простоты пропустим или попробуем извлечь имя из operationData? В ответе операции нет ссылки на объект. Оставим как есть — файлы будут удаляться автоматически по политике бакета или вручную.
+    // 2. Запускаем асинхронное распознавание SpeechKit
+    const operationId = await startAsyncRecognition(fileUrl, fileExt);
+
+    // Сохраняем task где-то, чтобы потом использовать. Можно в глобальную переменную, но у Netlify функций нет памяти. Поэтому передадим task через клиент при опросе статуса (как параметр). Или используем временное хранилище (Redis, Upstash). Для простоты клиент будет передавать task в check-status.
+    // В check-status мы получим task из query параметра.
 
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({ status: 'completed', feedback, recognizedText })
+      body: JSON.stringify({ operationId })
     };
   } catch (err) {
     console.error(err);
     return {
       statusCode: 500,
       headers,
-      body: JSON.stringify({ status: 'failed', error: err.message })
+      body: JSON.stringify({ error: err.message })
     };
   }
 }
 
-async function analyzeWithGPT(task, userSpeech) {
-  const prompt = `
-Ты — эксперт CEFR, уровень B2-C1.
-Задание: """${task}"""
-Речь пользователя (расшифровка): """${userSpeech}"""
+async function parseMultipart(event) {
+  return new Promise((resolve, reject) => {
+    const busboy = Busboy({ headers: { 'content-type': event.headers['content-type'] } });
+    let task = '';
+    let audioBuffer = null;
+    let originalName = '';
+    busboy.on('field', (fieldname, val) => {
+      if (fieldname === 'task') task = val;
+    });
+    busboy.on('file', (fieldname, file, info) => {
+      if (fieldname === 'audio') {
+        originalName = info.filename;
+        const chunks = [];
+        file.on('data', (chunk) => chunks.push(chunk));
+        file.on('end', () => audioBuffer = Buffer.concat(chunks));
+      } else file.resume();
+    });
+    busboy.on('finish', () => {
+      if (!task || !audioBuffer) reject(new Error('Missing fields'));
+      else resolve({ task, audioBuffer, originalName });
+    });
+    busboy.on('error', reject);
+    busboy.write(event.body, event.isBase64Encoded ? 'base64' : 'binary');
+    busboy.end();
+  });
+}
 
-Оцени по шкале 1-5:
-- Соответствие заданию и аргументация
-- Лексика (слова, идиомы)
-- Грамматическая сложность/точность
-- Беглость и связность
-- Произношение (приблизительно по тексту)
-
-Итоговый уровень (B2, B2+, C1). Напиши разбор, сильные/слабые стороны, 2 совета.
-Формат: дружелюбный, с эмодзи, абзацами.
-  `;
-  const url = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
+async function startAsyncRecognition(fileUrl, fileExt) {
+  const url = `https://transcribe.api.cloud.yandex.net/speech/stt/v2/longRunningRecognize`;
   const body = {
-    modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite`,
-    completionOptions: { stream: false, temperature: 0.4, maxTokens: 1200 },
-    messages: [
-      { role: 'system', text: 'Ты строгий экзаменатор английского B2-C1.' },
-      { role: 'user', text: prompt }
-    ]
+    config: {
+      specification: {
+        languageCode: 'ru-RU',
+        model: 'general',
+        audioEncoding: fileExt === 'm4a' ? 'M4A' : (fileExt === 'mp3' ? 'MP3' : 'LINEAR16_PCM'),
+      },
+    },
+    audio: { uri: fileUrl }
   };
   const resp = await fetch(url, {
     method: 'POST',
@@ -100,7 +118,10 @@ async function analyzeWithGPT(task, userSpeech) {
     },
     body: JSON.stringify(body)
   });
-  if (!resp.ok) throw new Error(`GPT error ${resp.status}`);
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Async recognize start error: ${err}`);
+  }
   const data = await resp.json();
-  return data.result?.alternatives?.[0]?.message?.text || 'Ошибка генерации анализа.';
+  return data.id; // operationId
 }
