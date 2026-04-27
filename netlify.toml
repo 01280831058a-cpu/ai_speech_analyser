@@ -1,0 +1,13 @@
+[build]
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[functions."start-analyze"]
+  timeout = 30   # больше времени на загрузку в S3 (секунд)
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
