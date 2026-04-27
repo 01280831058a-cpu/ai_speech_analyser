@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Speech Analyzer | B2-C1 | Большие файлы</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: system-ui, 'Segoe UI', monospace;
+        }
+        body {
+            background: linear-gradient(145deg, #1a2a3a 0%, #0f1a24 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+        }
+        .card {
+            max-width: 900px;
+            width: 100%;
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(12px);
+            border-radius: 2rem;
+            padding: 2rem;
+            box-shadow: 0 25px 45px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #f0f3f8;
+        }
+        h1 {
+            font-size: 1.9rem;
+            margin-top: 0;
+            background: linear-gradient(135deg, #FFD966, #FFB347);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            text-align: center;
+        }
+        .badge {
+            text-align: center;
+            background: #2c3e2f;
+            display: inline-block;
+            width: 100%;
+            padding: 6px;
+            border-radius: 40px;
+            font-size: 0.8rem;
+            margin-bottom: 20px;
+            background: #2a4b3b;
+        }
+        label {
+            font-weight: 600;
+            display: block;
+            margin: 20px 0 8px 0;
+        }
+        textarea {
+            width: 100%;
+            padding: 14px;
+            border-radius: 20px;
+            border: none;
+            background: #1e2a32;
+            color: white;
+            font-size: 1rem;
+            resize: vertical;
+        }
+        input[type="file"] {
+            background: #1e2a32;
+            padding: 12px;
+            border-radius: 20px;
+            width: 100%;
+            color: white;
+            border: 1px solid #FFB347;
+        }
+        button {
+            width: 100%;
+            margin-top: 30px;
+            padding: 14px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            background: #FF8C42;
+            border: none;
+            border-radius: 40px;
+            color: #1e1e2a;
+            cursor: pointer;
+            transition: 0.2s;
+            box-shadow: 0 5px 0 #a34e1a;
+        }
+        button:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 0 #a34e1a;
+        }
+        .result {
+            margin-top: 30px;
+            background: #0f1a1fcc;
+            padding: 18px;
+            border-radius: 24px;
+            white-space: pre-wrap;
+            border-left: 6px solid #FFB347;
+            font-size: 0.95rem;
+        }
+        .loading {
+            display: none;
+            margin-top: 20px;
+            text-align: center;
+            font-style: italic;
+        }
+        footer {
+            font-size: 0.7rem;
+            text-align: center;
+            margin-top: 25px;
+            opacity: 0.6;
+        }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h1>🎤 SPEAKING ANALYZER PRO</h1>
+    <div class="badge">🔥 CEFR B2-C1 · Асинхронное распознавание · Поддержка больших файлов (до 200 МБ)</div>
+
+    <label>📋 Твое задание (опиши ситуацию / вопрос)</label>
+    <textarea id="promptTask" rows="4" placeholder="Например: Discuss the environmental impact of fast fashion. Use specific examples and give solutions."></textarea>
+
+    <label>🎙 Загрузи ответ (m4a / mp3 / wav, до 200 МБ)</label>
+    <input type="file" id="audioFile" accept=".m4a,.mp3,.wav">
+
+    <button id="analyzeBtn">🧠 АНАЛИЗИРОВАТЬ</button>
+    <div class="loading" id="loading">⏳ Загружаем файл и запускаем распознавание...</div>
+    <div class="result" id="resultArea">✨ Здесь появится AI-оценка после обработки (нужно ~30-60 сек).</div>
+    <footer>🔒 Аудио сохраняется временно в Yandex Object Storage, распознаётся SpeechKit, затем удаляется.</footer>
+</div>
+
+<script>
+    let pollingInterval = null;
+    document.getElementById('analyzeBtn').addEventListener('click', async () => {
+        const task = document.getElementById('promptTask').value.trim();
+        const fileInput = document.getElementById('audioFile');
+        const file = fileInput.files[0];
+        const resultDiv = document.getElementById('resultArea');
+        const loadingDiv = document.getElementById('loading');
+
+        if (!task) {
+            resultDiv.innerHTML = "❌ Введите задание для спикинга";
+            return;
+        }
+        if (!file) {
+            resultDiv.innerHTML = "❌ Выберите аудиофайл (m4a, mp3, wav)";
+            return;
+        }
+
+        // Остановить предыдущий опрос, если был
+        if (pollingInterval) clearInterval(pollingInterval);
+
+        const formData = new FormData();
+        formData.append('task', task);
+        formData.append('audio', file);
+
+        loadingDiv.style.display = 'block';
+        resultDiv.innerHTML = "📤 Отправка файла и запуск распознавания...";
+
+        try {
+            const startRes = await fetch('/.netlify/functions/start-analyze', {
+                method: 'POST',
+                body: formData
+            });
+            const startData = await startRes.json();
+            if (!startRes.ok) throw new Error(startData.error || 'Ошибка запуска');
+            const { operationId } = startData;
+            resultDiv.innerHTML = `✅ Распознавание запущено (ID: ${operationId.slice(0,8)}...). Ждите результат, это может занять минуту.`;
+
+            // Начинаем опрос статуса каждые 3 секунды
+            loadingDiv.innerHTML = "🔄 Обработка аудио, пожалуйста, подождите...";
+            let attempts = 0;
+            pollingInterval = setInterval(async () => {
+                try {
+                    const statusRes = await fetch(`/.netlify/functions/check-status?operationId=${encodeURIComponent(operationId)}&task=${encodeURIComponent(task)}`);
+                    const statusData = await statusRes.json();
+                    if (statusData.status === 'completed') {
+                        clearInterval(pollingInterval);
+                        loadingDiv.style.display = 'none';
+                        resultDiv.innerHTML = statusData.feedback;
+                    } else if (statusData.status === 'failed') {
+                        clearInterval(pollingInterval);
+                        loadingDiv.style.display = 'none';
+                        resultDiv.innerHTML = `❌ Распознавание не удалось: ${statusData.error || 'неизвестная ошибка'}`;
+                    } else {
+                        // ещё обрабатывается
+                        loadingDiv.innerHTML = `⏳ Распознаётся речь (${Math.min(attempts*3, 60)} сек)...`;
+                    }
+                    attempts++;
+                    if (attempts > 40) { // 40*3 = 120 сек таймаут
+                        clearInterval(pollingInterval);
+                        loadingDiv.style.display = 'none';
+                        resultDiv.innerHTML = "⏰ Превышено время ожидания. Попробуйте снова или уменьшите файл.";
+                    }
+                } catch (err) {
+                    console.error('Polling error', err);
+                }
+            }, 3000);
+        } catch (err) {
+            loadingDiv.style.display = 'none';
+            resultDiv.innerHTML = `❌ Ошибка: ${err.message}`;
+        }
+    });
+</script>
+</body>
+</html>
